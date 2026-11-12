@@ -19,9 +19,9 @@ import { APP_VERSION } from "@/lib/appVersion";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
-const RELEASES_URL = "https://github.com/weifu1997/library/releases";
+const RELEASES_URL = "https://github.com/demonsxxxxxx/library/releases";
 const LATEST_RELEASE_API =
-  "https://api.github.com/repos/weifu1997/library/releases/latest";
+  "https://api.github.com/repos/demonsxxxxxx/library/releases/latest";
 
 interface LatestRelease {
   tag_name?: string;
@@ -122,7 +122,7 @@ export function AboutPage() {
           <div className="grid gap-3.5 sm:grid-cols-2">
             <ExternalLinkButton
               icon={FolderGit2}
-              href="https://github.com/weifu1997/library"
+              href="https://github.com/demonsxxxxxx/library"
               title={t.about.projectHomepage}
               subtitle="Source code & repository"
             />
@@ -134,13 +134,13 @@ export function AboutPage() {
             />
             <ExternalLinkButton
               icon={Code2}
-              href="https://github.com/weifu1997/library/issues"
+              href="https://github.com/demonsxxxxxx/library/issues"
               title={t.about.reportIssue}
               subtitle="Bug reports & feature requests"
             />
             <ExternalLinkButton
               icon={FileCode2}
-              href="https://github.com/weifu1997/library/blob/main/LICENSE"
+              href="https://github.com/demonsxxxxxx/library/blob/main/LICENSE"
               title={t.about.license}
               subtitle="Open Source MIT License"
             />

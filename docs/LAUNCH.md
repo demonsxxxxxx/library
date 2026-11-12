@@ -86,7 +86,7 @@ It has two modes:
 
 There is a Python CLI. It is AGPL.
 
-Repo: https://github.com/weifu1997/library
+Repo: https://github.com/demonsxxxxxx/library
 
 I would especially like feedback from people who manage large private research
 libraries or have built RAG systems over messy local files.
@@ -139,7 +139,7 @@ What I would like feedback on:
 - Whether Quick vs Deep mode is the right UX for latency/cost tradeoffs.
 - Which ingest formats or citation workflows are still missing.
 
-Repo: https://github.com/weifu1997/library
+Repo: https://github.com/demonsxxxxxx/library
 
 ## Chinese Communities
 
@@ -164,7 +164,7 @@ journal 和可选语义召回缩小范围,再读取原文窗口,最后输出带�
 
 当前有 Windows/macOS/Linux 桌面包,也有 Python CLI。
 
-仓库: https://github.com/weifu1997/library
+仓库: https://github.com/demonsxxxxxx/library
 
 欢迎重点喷 README、安装体验、桌面端交互和真实资料库里的检索效果。
 
