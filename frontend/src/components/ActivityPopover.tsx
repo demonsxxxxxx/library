@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { CheckCircle2, XCircle, Loader2, Sparkles, Activity } from "lucide-react";
+import { CheckCircle2, XCircle, Ban, Loader2, Sparkles, Activity } from "lucide-react";
 
 import { tasks } from "@/api/client";
 import type { ActiveTask, RecentTask } from "@/types/api";
@@ -179,6 +179,8 @@ function RecentRow({ task }: { task: RecentTask }) {
       <div className="flex items-center gap-2.5">
         {ok ? (
           <CheckCircle2 size={13} className="shrink-0 text-emerald-500" />
+        ) : task.status === "cancelled" ? (
+          <Ban size={13} className="shrink-0 text-fg-subtle" aria-label={t.activity.cancelled} />
         ) : (
           <XCircle size={13} className="shrink-0 text-danger" />
         )}
@@ -200,7 +202,10 @@ function RecentRow({ task }: { task: RecentTask }) {
           {usageLine}
         </div>
       )}
-      {!ok && task.last_error && (
+      {task.status === "cancelled" && (
+        <div className="ml-[22px] mt-1 text-fg-subtle">{t.activity.cancelled}</div>
+      )}
+      {task.status === "dead" && task.last_error && (
         <div
           className="ml-[22px] mt-1 rounded bg-danger-subtle/80 px-2 py-1 text-[11px] text-danger border border-danger/20 font-mono"
           title={task.last_error}

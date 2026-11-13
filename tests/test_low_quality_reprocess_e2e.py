@@ -38,7 +38,7 @@ from library.config import get_settings
 get_settings.cache_clear()  # type: ignore[attr-defined]
 
 from library.db.engine import get_engine, get_session_factory
-from library.db.models import Base, File, TaskOutcome
+from library.db.models import Base, File, FileEntry, TaskOutcome
 from library.tasks.handlers.periodic_tick import (
     LOW_QUALITY_OUTCOME_KIND,
     _dispatch_reprocess_low_quality,
@@ -82,6 +82,11 @@ async def _insert_file(
             deleted_at=now if deleted else None,
         )
         s.add(row)
+        await s.flush()
+        s.add(FileEntry(
+            id=new_id(), file_id=fid, display_name=f"{fid}.md",
+            lifecycle="active", created_at=now, updated_at=now,
+        ))
         await s.commit()
     return fid
 

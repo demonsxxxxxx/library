@@ -3,11 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
-from sqlalchemy import and_
+from sqlalchemy import and_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from library.db.models import File
 from library.db.models.tasks import Task
 from library.repositories import tasks as tasks_repo
 from library.tasks.kinds import DEFAULT_PRIORITIES
@@ -27,6 +28,16 @@ async def enqueue(
     """Enqueue a task. If `dedup_key` matches an existing pending/running row,
     skip insertion and return the existing task (or None if it cannot be reused)."""
     now = datetime.now(timezone.utc)
+    if kind == "ingest_file" and (payload or {}).get("file_id"):
+        file_id = str(payload["file_id"])
+        await session.flush()
+        await tasks_repo.lock_ingest_file(session, file_id)
+        if not await session.scalar(select(
+            tasks_repo.live_ingest_file_ids().where(
+                File.id == file_id,
+            ).exists()
+        )):
+            return None
     if dedup_key is not None:
         existing = await tasks_repo.find_pending_or_running_by_dedup(
             session, dedup_key,

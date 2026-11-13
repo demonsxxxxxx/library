@@ -10,7 +10,53 @@ from typing import Sequence
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from library.db.models import File, FileEntry
 from library.db.models.tasks import Task
+
+
+async def lock_ingest_file(db: AsyncSession, file_id: str) -> None:
+    """Serialize deletion, dispatch and persistence, including across processes."""
+    await db.execute(
+        update(File).where(File.id == file_id).values(updated_at=File.updated_at)
+        .execution_options(synchronize_session=False)
+    )
+
+
+def live_ingest_file_ids():
+    return select(File.id).where(
+        File.deleted_at.is_(None),
+        select(FileEntry.id).where(
+            FileEntry.file_id == File.id, FileEntry.deleted_at.is_(None),
+        ).exists(),
+    )
+
+
+async def cancel_orphan_ingests(
+    db: AsyncSession, *, now: datetime, file_ids: Sequence[str] | None = None,
+) -> int:
+    """Caller flushes entry deletions first; no dedup key required for legacy rows."""
+    file_id = Task.payload["file_id"].as_string()
+    stmt = update(Task).where(
+        Task.kind == "ingest_file", Task.status.in_(("pending", "running")),
+        file_id.is_not(None), ~file_id.in_(live_ingest_file_ids()),
+    )
+    if file_ids is not None:
+        if not file_ids:
+            return 0
+        stmt = stmt.where(file_id.in_(list(file_ids)))
+    result = await db.execute(stmt.values(_release_values(
+        status="cancelled", finished_at=now, last_error="no_live_entry",
+    )).execution_options(synchronize_session=False))
+    return int(result.rowcount or 0)
+
+
+async def mark_cancelled(
+    db: AsyncSession, *, task_id: str, now: datetime, reason: str, worker_id: str,
+) -> bool:
+    result = await db.execute(update(Task).where(
+        Task.id == task_id, Task.status == "running", Task.locked_by == worker_id,
+    ).values(_release_values(status="cancelled", finished_at=now, last_error=reason)))
+    return bool(result.rowcount or 0)
 
 
 def _release_values(**extras: object) -> dict[str, object]:
@@ -50,7 +96,14 @@ async def claim_pending_ids(
     FOR UPDATE so the caller is expected to be the only worker."""
     stmt = (
         select(Task.id)
-        .where(Task.status == "pending", Task.scheduled_at <= now)
+        .where(
+            Task.status == "pending", Task.scheduled_at <= now,
+            or_(
+                Task.kind != "ingest_file",
+                Task.payload["file_id"].as_string().is_(None),
+                Task.payload["file_id"].as_string().in_(live_ingest_file_ids()),
+            ),
+        )
         .order_by(Task.priority.asc(), Task.scheduled_at.asc())
         .limit(limit)
     )
@@ -364,7 +417,7 @@ async def list_by_ids(db: AsyncSession, ids: list[str]) -> list[Task]:
 async def oldest_terminal_finished_at(db: AsyncSession) -> datetime | None:
     return await db.scalar(
         select(func.min(Task.finished_at)).where(
-            Task.status.in_(("done", "dead")),
+            Task.status.in_(("done", "dead", "cancelled")),
             Task.finished_at.is_not(None),
         )
     )
@@ -380,7 +433,7 @@ async def delete_terminal_batch_before(
     ids = list((await db.execute(
         select(Task.id)
         .where(
-            Task.status.in_(("done", "dead")),
+            Task.status.in_(("done", "dead", "cancelled")),
             Task.finished_at.is_not(None),
             Task.finished_at < cutoff,
         )
@@ -442,7 +495,7 @@ async def list_recent_with_usage(
         .scalar_subquery()
     )
     statement = select(Task, latest_detail.label("detail")).where(
-        Task.status.in_(("done", "dead")),
+        Task.status.in_(("done", "dead", "cancelled")),
         Task.finished_at.is_not(None),
     )
     if before is not None:
@@ -467,7 +520,7 @@ async def list_recent_with_usage(
             "finished_at": t.finished_at,
             "last_error": t.last_error,
             "payload": t.payload or {},
-            "detail": detail or {},
+            "detail": {} if t.status == "cancelled" else detail or {},
         }
         for t, detail in rows
     ]

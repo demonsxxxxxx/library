@@ -77,6 +77,7 @@ const en = {
     inFlight: "In flight",
     recent: "Recent",
     noTasks: "No tasks yet.",
+    cancelled: "Cancelled — source deleted",
     cache: (pct: number) => `${pct}% cache`,
     cacheSlo: (status: string): string => status === "met"
       ? "cache SLO met"
@@ -913,6 +914,7 @@ const zh: I18nStrings = {
     inFlight: "进行中",
     recent: "最近完成",
     noTasks: "暂无任务。",
+    cancelled: "已取消 — 原文件已删除",
     cache: (pct: number) => `缓存 ${pct}%`,
     cacheSlo: (status: string) => status === "met"
       ? "缓存 SLO 达标"

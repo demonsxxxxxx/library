@@ -22,6 +22,7 @@ from library.db.models import File, Folder
 from library.repositories import audit_events as audit_events_repo
 from library.repositories import entries as entries_repo
 from library.repositories import folders as folders_repo
+from library.repositories import tasks as tasks_repo
 from library.storage import MirrorStorage, get_storage
 from library.utils.ids import new_id
 
@@ -384,6 +385,11 @@ async def soft_delete_folder(
 
     descendant_ids = await folders_repo.list_live_descendant_ids(db, f.id)
 
+    entries = await folders_repo.list_live_entries_in(db, descendant_ids)
+    file_ids = sorted({e.file_id for e in entries})
+    for file_id in file_ids:
+        await tasks_repo.lock_ingest_file(db, file_id)
+
     n_folders = 0
     for fid in descendant_ids:
         fld = await db.get(Folder, fid)
@@ -393,12 +399,13 @@ async def soft_delete_folder(
         fld.updated_at = now
         n_folders += 1
 
-    entries = await folders_repo.list_live_entries_in(db, descendant_ids)
     for e in entries:
         e.deleted_at = now
         e.purge_after = purge_at
         e.updated_at = now
 
+    await db.flush()
+    await tasks_repo.cancel_orphan_ingests(db, now=now, file_ids=file_ids)
     await audit_events_repo.append(db, kind="folder_soft_deleted", payload={
         "folder_id": f.id,
         "name": f.name,

@@ -105,7 +105,7 @@ async def list_recent(
     limit: int = Query(default=30, ge=1, le=200),
     cursor: str | None = Query(default=None),
 ) -> dict[str, Any]:
-    """Recently-finished tasks (done + dead), newest first, with the
+    """Recently-finished tasks (done + dead + cancelled), newest first, with the
     per-run usage detail captured by the runner. Powers the StatusBar
     Activity popover so users can see how long ingest / reflect / embed
     took and how many tokens each call burned."""
@@ -222,7 +222,7 @@ def _task_throughput_payload(
     for task in terminal:
         throughput_kind = _throughput_kind(task)
         row = by_kind.get(throughput_kind)
-        if row is None:
+        if row is None or task.status not in {"done", "dead"}:
             continue
         if task.status == "done":
             row["done"] += 1

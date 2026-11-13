@@ -57,11 +57,16 @@ async def acquire_model_call_slot(
                 limiter.timestamps.popleft()
             if len(limiter.timestamps) < limit:
                 limiter.timestamps.append(now)
-                return waited
+                break
             sleep_for = max(_WINDOW_SECONDS - (now - limiter.timestamps[0]), 0.0)
         if sleep_for > 0:
             waited += sleep_for
             await asyncio.sleep(sleep_for)
+
+    # A queued rate-limit wait must not start a provider call after deletion.
+    from library.tasks.ingest_guard import check_ingest_delivery
+    await check_ingest_delivery()
+    return waited
 
 
 def reset_model_rate_limiters_for_tests() -> None:

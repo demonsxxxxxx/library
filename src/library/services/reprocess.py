@@ -28,6 +28,7 @@ from library.repositories import entries as entries_repo
 from library.repositories import entry_relations as entry_relations_repo
 from library.repositories import entry_tags as entry_tags_repo
 from library.repositories import files as files_repo
+from library.repositories import tasks as tasks_repo
 from library.tasks.enqueue import enqueue
 from library.tasks.kinds import KIND_INGEST_FILE
 
@@ -43,7 +44,7 @@ def bulk_reprocess_file_ids_statement(
     limit: int | None = None,
 ):
     """Build a stable, paged file-id query for a bulk reprocess scope."""
-    stmt = select(File.id).where(File.deleted_at.is_(None))
+    stmt = select(File.id).where(File.id.in_(tasks_repo.live_ingest_file_ids()))
     requires_entry_join = bool(
         payload.get("catalog_ids")
         or payload.get("folder_ids")
@@ -85,8 +86,12 @@ async def reprocess_file(
     `scheduled_by` is recorded in the task_enqueued audit so we can
     distinguish user-driven reprocess from periodic self-heal in logs.
     """
-    now = _utcnow()
+    await tasks_repo.lock_ingest_file(session, file_row.id)
+    await session.refresh(file_row)
     entry_ids = await files_repo.list_live_entry_ids_for_file(session, file_row.id)
+    if file_row.deleted_at is not None or not entry_ids:
+        return None
+    now = _utcnow()
     for eid in entry_ids:
         await entry_tags_repo.delete_all_for_entry(session, eid)
     relation_count = await entry_relations_repo.delete_all_touching_entries(

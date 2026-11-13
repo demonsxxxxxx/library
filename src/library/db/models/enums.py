@@ -7,7 +7,7 @@ ALTERs the CHECK constraint, and only then start writing the new value.
 from __future__ import annotations
 
 
-TASK_STATUSES: tuple[str, ...] = ("pending", "running", "done", "dead")
+TASK_STATUSES: tuple[str, ...] = ("pending", "running", "done", "dead", "cancelled")
 
 INGEST_STATUSES: tuple[str, ...] = ("pending", "processing", "done", "failed")
 

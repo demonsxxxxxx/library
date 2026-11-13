@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from library.db.bootstrap import bootstrap_schema_sync
-from library.db.models import File, Task
+from library.db.models import File, FileEntry, Task
 from library.tasks.handlers import bulk_reprocess_files as module
 from library.utils.ids import new_id
 
@@ -52,6 +52,10 @@ async def test_bulk_reprocess_dispatcher_pages_and_checkpoints(
                     deleted_at=None,
                     created_at=now,
                     updated_at=now,
+                ))
+                session.add(FileEntry(
+                    id=new_id(), file_id=file_id, display_name=f"{index}.txt",
+                    lifecycle="active", created_at=now, updated_at=now,
                 ))
             session.add(Task(
                 id=dispatcher_id,

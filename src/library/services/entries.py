@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from library.db.models import File, FileEntry, Folder
 from library.repositories import audit_events as audit_events_repo
+from library.repositories import tasks as tasks_repo
 from library.services.upload import (
     DisplayNameConflictError,
     _existing_entry_with_name,
@@ -247,10 +248,16 @@ async def soft_delete_entry(
     purge_after_seconds: int = 7 * 86400,
 ) -> FileEntry:
     entry = await _get_live_entry(db, entry_id)
+    await tasks_repo.lock_ingest_file(db, entry.file_id)
+    await db.refresh(entry)
+    if entry.deleted_at is not None:
+        raise EntryNotFoundError(entry_id)
     now = _utcnow()
     entry.deleted_at = now
     entry.purge_after = now + timedelta(seconds=max(0, purge_after_seconds))
     entry.updated_at = now
+    await db.flush()
+    await tasks_repo.cancel_orphan_ingests(db, now=now, file_ids=[entry.file_id])
     await audit_events_repo.append(db, kind="entry_soft_deleted", payload={
         "entry_id": entry.id,
         "folder_id": entry.folder_id,

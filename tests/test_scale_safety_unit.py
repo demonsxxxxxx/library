@@ -589,7 +589,7 @@ async def test_prune_batch_loop_honors_max_batches() -> None:
 def test_migration_head_contains_durable_event_ledger() -> None:
     from library.db.bootstrap import ALEMBIC_HEAD_REVISION, SCALE_SAFETY_INDEXES
 
-    assert ALEMBIC_HEAD_REVISION == "0016_scale_safety_indexes"
+    assert ALEMBIC_HEAD_REVISION == "0017_cancelled_ingest_tasks"
     assert {name for name, _table, _columns in SCALE_SAFETY_INDEXES} == {
         "ix_files_capacity_active",
         "ix_conversations_active_started",

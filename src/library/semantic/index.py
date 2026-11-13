@@ -463,9 +463,11 @@ async def _build_semantic_index(
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        tmp_meta.replace(out_dir / "entries.jsonl")
-        tmp_vec.replace(out_dir / "vectors.f32")
-        manifest_tmp.replace(out_dir / "manifest.json")
+        from library.tasks.ingest_guard import ingest_publication_fence
+        async with ingest_publication_fence():
+            tmp_meta.replace(out_dir / "entries.jsonl")
+            tmp_vec.replace(out_dir / "vectors.f32")
+            manifest_tmp.replace(out_dir / "manifest.json")
     except BaseException:
         # Failed build: unlink the per-PID tmp files so they don't leak. The
         # fixed-name resume tmps (resume=True) are left in place so an explicit
@@ -748,12 +750,14 @@ async def _refresh_semantic_index_for_file(
         "section_entries": sum(bool(row.get("section_id")) for row in next_metadata),
         "created_at_ms": int(time.time() * 1000),
     }
-    _replace_file_index(
-        out_dir,
-        manifest=next_manifest,
-        metadata=next_metadata,
-        vectors=bytes(next_vectors),
-    )
+    from library.tasks.ingest_guard import ingest_publication_fence
+    async with ingest_publication_fence():
+        _replace_file_index(
+            out_dir,
+            manifest=next_manifest,
+            metadata=next_metadata,
+            vectors=bytes(next_vectors),
+        )
     _load_semantic_index_cached.cache_clear()
 
     if len(next_metadata) <= 0:

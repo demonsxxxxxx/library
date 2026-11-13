@@ -50,6 +50,14 @@ async def handle_recover_stuck_tasks(payload: Mapping[str, Any]) -> None:
             limit=limit,
         )
 
+        file_ids = sorted({
+            str(t.payload["file_id"]) for t in rows
+            if t.kind == "ingest_file" and (t.payload or {}).get("file_id")
+        })
+        for file_id in file_ids:
+            await tasks_repo.lock_ingest_file(session, file_id)
+        await tasks_repo.cancel_orphan_ingests(session, now=now, file_ids=file_ids)
+
         recovered = 0
         marked_dead = 0
         for t in rows:

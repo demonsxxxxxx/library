@@ -41,6 +41,8 @@ from library.repositories import catalogs as catalogs_repo
 from library.repositories import entries as entries_repo
 from library.repositories import entry_tags as entry_tags_repo
 from library.repositories import tags as tags_repo
+from library.repositories import tasks as tasks_repo
+from library.tasks.ingest_guard import check_ingest_delivery, guard_ingest_delivery, IngestCancelled
 from library.semantic.index import refresh_semantic_index_for_file
 from library.storage import get_storage
 from library.tasks.kinds import KIND_INGEST_FILE, task_handler
@@ -54,6 +56,7 @@ TAG_VOCAB_LIMIT = 100
 
 
 @task_handler(KIND_INGEST_FILE)
+@guard_ingest_delivery
 async def handle_ingest_file(payload: Mapping[str, Any]) -> None:
     file_id = payload.get("file_id")
     if not file_id:
@@ -64,6 +67,8 @@ async def handle_ingest_file(payload: Mapping[str, Any]) -> None:
     # --- phase 1: mark processing ------------------------------------------
     with measure_stage("status_persist"):
         async with session_scope() as session:
+            await tasks_repo.lock_ingest_file(session, file_id)
+            await check_ingest_delivery(session)
             file_row = await session.get(File, file_id)
             if file_row is None:
                 raise ValueError(f"file_id {file_id!r} not found")
@@ -133,6 +138,7 @@ async def handle_ingest_file(payload: Mapping[str, Any]) -> None:
 
     # --- phase 2: pipeline -------------------------------------------------
     try:
+        await check_ingest_delivery()
         with measure_stage("pipeline_total"):
             result = await pipeline.run(ctx=ctx, storage=storage)
     except Exception:
@@ -145,6 +151,7 @@ async def handle_ingest_file(payload: Mapping[str, Any]) -> None:
             await _persist(session, file_id=file_id, entry_id=entry_id, result=result)
             await session.commit()
     with measure_stage("embedding"):
+        await check_ingest_delivery()
         await _refresh_semantic_index(file_id)
 
 
@@ -154,6 +161,8 @@ def _utcnow() -> datetime:
 
 async def _mark_failed(file_id: str, *, reason: str) -> None:
     async with session_scope() as session:
+        await tasks_repo.lock_ingest_file(session, file_id)
+        await check_ingest_delivery(session)
         file_row = await session.get(File, file_id)
         if file_row is not None:
             file_row.ingest_status = "failed"
@@ -261,11 +270,18 @@ async def _persist(
     entry_id: str,
     result: PipelineResult,
 ) -> None:
+    await tasks_repo.lock_ingest_file(session, file_id)
+    await check_ingest_delivery(session)
     now = _utcnow()
     file_row = await session.get(File, file_id)
     entry = await session.get(FileEntry, entry_id)
-    if file_row is None or entry is None:
-        raise ValueError("file/entry vanished mid-ingest")
+    if file_row is None or file_row.deleted_at is not None:
+        raise IngestCancelled("file deleted mid-ingest")
+    if entry is None or entry.deleted_at is not None:
+        entry = await entries_repo.find_first_live_for_file(session, file_id)
+    if entry is None:
+        raise IngestCancelled("no_live_entry")
+    entry_id = entry.id
 
     # --- write-once enforcement on file content fields --------------------
     if file_row.ingested_at is None:

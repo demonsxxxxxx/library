@@ -72,12 +72,14 @@ async def _dispatch_bulk_reprocess_pages(
                 session,
                 f"ingest_file:{file_id}",
             )
-            await reprocess_file(
+            task_id = await reprocess_file(
                 session,
                 file_row,
                 scheduled_by=str(task_payload.get("scheduled_by") or "bulk_reprocess"),
             )
-            if existing is None:
+            if task_id is None:
+                skipped += 1
+            elif existing is None:
                 tasks_created += 1
             else:
                 tasks_reused += 1

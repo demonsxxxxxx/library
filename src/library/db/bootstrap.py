@@ -1007,6 +1007,42 @@ def bootstrap_baseline_sync(bind) -> None:
     )
 
 
+def _ensure_cancelled_tasks(bind) -> None:
+    """Widen the task terminal-state CHECK without discarding queue history."""
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from library.db.models import File, FileEntry, Task
+    from library.db.models.enums import TASK_STATUSES, _in_clause
+
+    inspector = sa.inspect(bind)
+    if "tasks" not in inspector.get_table_names():
+        return
+    checks = inspector.get_check_constraints("tasks")
+    status_check = next((c for c in checks if c["name"] == "ck_tasks_status"), None)
+    if status_check and "cancelled" not in status_check["sqltext"]:
+        operations = Operations(MigrationContext.configure(bind))
+        with operations.batch_alter_table("tasks") as batch:
+            batch.drop_constraint(operations.f("ck_tasks_status"), type_="check")
+            batch.create_check_constraint(
+                operations.f("ck_tasks_status"), _in_clause("status", TASK_STATUSES),
+            )
+
+    live_files = sa.select(File.id).where(
+        File.deleted_at.is_(None),
+        sa.select(FileEntry.id).where(
+            FileEntry.file_id == File.id, FileEntry.deleted_at.is_(None),
+        ).exists(),
+    )
+    bind.execute(sa.update(Task).where(
+        Task.kind == "ingest_file", Task.status.in_(("pending", "running")),
+        Task.payload["file_id"].as_string().is_not(None),
+        ~Task.payload["file_id"].as_string().in_(live_files),
+    ).values(
+        status="cancelled", finished_at=datetime.now(timezone.utc),
+        locked_by=None, lease_expires_at=None, last_error="no_live_entry",
+    ))
+
+
 def _ensure_agent_events(bind) -> None:
     """Create the durable public chat-event ledger on existing databases."""
     Base.metadata.tables["agent_events"].create(bind=bind, checkfirst=True)
@@ -1033,6 +1069,7 @@ POST_BASELINE_SHIMS: tuple[tuple[str, Callable[[Any], None]], ...] = (
     ("0014_files_kind_check", _relax_files_kind_check),
     ("0015_agent_events", _ensure_agent_events),
     ("0016_scale_safety_indexes", _ensure_scale_safety_indexes),
+    ("0017_cancelled_ingest_tasks", _ensure_cancelled_tasks),
 )
 
 ALEMBIC_HEAD_REVISION = POST_BASELINE_SHIMS[-1][0]

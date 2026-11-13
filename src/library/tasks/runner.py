@@ -14,6 +14,7 @@ from library.repositories import tasks as tasks_repo
 from library.repositories import task_outcomes as outcomes_repo
 from library.services.ingest_status import mark_file_failed_for_dead_ingest_task
 from library.tasks import handlers as _handlers_pkg  # noqa: F401  (register)
+from library.tasks.ingest_guard import IngestCancelled
 from library.tasks.kinds import KIND_PERIODIC_TICK, LLM_DEPENDENT_KINDS, get_handler
 from library.tasks.usage import (
     bind_accumulator, unbind_accumulator, UsageCounters,
@@ -92,6 +93,11 @@ class TaskRunner:
         Runs once per start(). The user's path back is: set a key,
         restart the app — bootstrap_periodic_tick will then re-enqueue
         the periodic kinds normally on the next startup."""
+        # Reconcile legacy orphan ingests before the no-key failure sweep;
+        # deletion is cancellation, never a missing-key parsing failure.
+        async with session_scope() as session:
+            await tasks_repo.cancel_orphan_ingests(session, now=_now())
+            await session.commit()
         if self._has_llm_key():
             return
         async with session_scope() as session:
@@ -234,8 +240,9 @@ class TaskRunner:
             # Handlers normally consume only their public payload. Reserved
             # runtime fields let resumable work bind checkpoints to the exact
             # task row without changing every handler signature.
-            payload.setdefault("_task_id", task_id)
-            payload.setdefault("_task_attempt", attempts)
+            payload["_task_id"] = task_id
+            payload["_task_owner"] = owner_id
+            payload["_task_attempt"] = attempts
 
         if handler is None:
             await self._fail(
@@ -281,6 +288,15 @@ class TaskRunner:
         )
         try:
             await handler_task
+        except IngestCancelled as exc:
+            unbind_accumulator(token)
+            async with session_scope() as session:
+                await tasks_repo.mark_cancelled(
+                    session, task_id=task_id, now=_now(),
+                    reason=str(exc), worker_id=owner_id,
+                )
+                await session.commit()
+            return
         except asyncio.CancelledError:
             # A failed fenced heartbeat means another delivery now owns this
             # row. Stop cooperative handler work promptly and leave all queue
@@ -400,6 +416,13 @@ class TaskRunner:
         owner_id = owner_id or self.worker_id
         async with session_scope() as session:
             task = await tasks_repo.get(session, task_id)
+            if task is not None and task.kind == "ingest_file":
+                file_id = (task.payload or {}).get("file_id")
+                if file_id:
+                    await tasks_repo.lock_ingest_file(session, str(file_id))
+                    await tasks_repo.cancel_orphan_ingests(
+                        session, now=_now(), file_ids=[str(file_id)],
+                    )
             if attempts >= max_attempts:
                 changed = await tasks_repo.mark_dead(
                     session,

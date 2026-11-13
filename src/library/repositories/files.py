@@ -235,6 +235,9 @@ async def find_low_quality(
             .where(
                 File.deleted_at.is_(None),
                 File.ingested_at.is_not(None),
+                select(FileEntry.id).where(
+                    FileEntry.file_id == File.id, FileEntry.deleted_at.is_(None),
+                ).exists(),
                 or_(
                     File.summary.is_(None),
                     func.length(func.coalesce(func.trim(File.summary), "")) < min_summary_chars,

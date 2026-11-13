@@ -271,7 +271,7 @@ export interface ActiveTasks {
 export interface RecentTask {
   id: string;
   kind: string;
-  status: "done" | "dead";
+  status: "done" | "dead" | "cancelled";
   label: string;
   file_id?: string | null;
   entry_id?: string | null;
