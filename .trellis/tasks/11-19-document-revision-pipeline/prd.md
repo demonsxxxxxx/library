@@ -172,11 +172,14 @@ R12. 视觉增强只能作为 asset 或 content range 的附加 enrichment，不
 - [ ] 索引删除/重建不影响 revision、source map 和 assets。
 - [ ] W/L 对比完成，R 的 PDF 基线结果可复核。
 - [ ] 当前 LLM 直读线路仍可作为 fallback 运行。
+- [ ] 摘要/元数据导航层与 `content.md` 正文证据层可以并存。
+- [ ] 双层 Agentic Search 能在摘要候选范围内定位正文，并在证据不足时扩大正文搜索范围。
 - [ ] 未执行任何实施代码提交、发布、部署、批量重解析或公盘写入。
 
 ## 8. 当前状态
 
 - 模块 1 已锁定。
 - 模块 2 已锁定为 W/L 对比、R 做 PDF 基线。
+- 模块 3 正在讨论：摘要/元数据导航与 `content.md` 正文证据搜索并存；尚未锁定 FTS/GREP、正文向量、rerank 或 SearchHit 最终契约。
 - 尚未部署解析服务、尚未运行 W/L/R 对比、尚未修改 Library 代码。
-- 下一模块：revision 如何生成索引、summary 和 `SearchHit` 契约。
+- 模块 3 讨论记录：`module-03-retrieval-discussion.zh-CN.md`。

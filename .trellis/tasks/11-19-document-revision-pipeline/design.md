@@ -405,15 +405,27 @@ ingest_file
 - 不同配置或不同解析器必须生成新 revision。
 - 任务重试不能产生重复 active revision。
 
-## 8. 索引与查询（模块 3 边界）
+## 8. 双层检索与查询（模块 3，待商榷）
 
-本设计只定义边界，不在本任务实现：
+本设计只记录候选边界，不在本任务实现，也不锁定最终索引方案：
 
-- 首期对 `content.md` 范围建 FTS5。
-- summary/sections 单独建可检索字段。
-- 内部 segment 可选，必须可重建。
-- `SearchHit` 返回 document、revision、content range、source map、locator 和 assets。
+```text
+第一层：summary / metadata / sections → 候选文档和候选页面
+第二层：revision/content.md → 正文命中范围
+source-map → PDF页/Word段落/Excel单元/PPT slide
+```
+
+候选原则：
+
+- 保留现有摘要/元数据导航和可选摘要向量；
+- `content.md` 作为第二层正文搜索面；
+- 候选 revision 先局部搜索，证据不足时扩大授权范围；
+- 精确匹配/GREP、FTS/BM25、正文向量和 rerank 仍需评测后决定；
+- 内部 segment 可选，必须可重建；
+- `SearchHit` 未来应返回 document、revision、content range、source map、locator 和 assets；
 - 查询不得依赖产品 Chunk ID。
+
+详细讨论见同目录 `module-03-retrieval-discussion.zh-CN.md`。
 
 ## 9. 前端边界（模块 4 边界）
 
