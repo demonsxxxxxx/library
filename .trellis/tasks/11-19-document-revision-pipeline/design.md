@@ -37,7 +37,7 @@ File/FileEntry
   ↓
 解析调度：按内容形态/页面分路
   ↓
-Parser adapter（W/L/R 或 Library 原生）
+Parser adapter（W/L/R、Library 原生或视觉模型）
   ↓
 revision 目录（不可变）
   ├─ manifest.json
@@ -49,7 +49,7 @@ revision 目录（不可变）
   ↓
 Library 后处理
   ├─ summary/sections/description/tags
-  ├─ FTS5
+  ├─ 摘要及元数据索引
   ├─ 可选 semantic index / sqlite-vec
   └─ SearchHit 契约
   ↓
@@ -98,7 +98,7 @@ document-revisions/<revision_id>/
   },
   "parser": {
     "route": "text|layout|ocr|mixed",
-    "name": "weknora-docreader|docling|deepdoc|library-native",
+    "name": "weknora-docreader|docling|deepdoc|library-native|vision-model",
     "version": "...",
     "config_digest": "..."
   },
@@ -204,7 +204,7 @@ Markdown 引用：
 | --- | --- | --- |
 | 文字结构 | DOCX/XLSX/PPTX/HTML/MD/TXT；简单文字层 PDF | 原生段落、表格、sheet/cell、slide/shape |
 | PDF 版面 | 双栏、复杂文字层、表格/图表页 | reading order、page/bbox、表格结构 |
-| OCR 图像 | 扫描 PDF、图片文档、无可靠文字层页面 | OCR、文字框、表格、页面图 |
+| 图像识别 | 扫描 PDF、图片文档、无可靠文字层的页或区域 | 视觉模型直接读图；转录 Markdown、页/区域定位和不确定项 |
 | 混合页 | 同一 PDF 含文字页、扫描页、复杂页 | 逐页选择路线并合并 |
 | 视觉增强 | 已提取的图片/图表/曲线 | OCR/caption/VLM enrichment |
 
@@ -213,16 +213,17 @@ Markdown 引用：
 ```text
 PDF
   → 页面是否有可靠文字层？
-     ├─ 否 → OCR + 图像版面
-     └─ 是 → 版面是否简单？
-              ├─ 是 → 文字结构
-              └─ 否 → PDF 版面
-  → 页面/区域是否含图表或图片？
-     ├─ 否 → 完成
-     └─ 是 → 可选视觉增强
+     ├─ 否 → 视觉模型直接识别整页图
+     └─ 是 → 按版面复杂度选择原生文字或 PDF 版面解析
+              └─ 有未覆盖且需要识别的区域 → 视觉模型补读该区域
+  → 合并原生文字与视觉转录，记录页级覆盖和来源
 ```
 
-路由结果必须写回 manifest 的页级状态，而不是只记录一个全局 parser 名。
+独立图片直接走图像识别。送模使用实际页图或裁图，不要求先过 PaddleOCR 或 MinerU。首期优先接入 `deepseek-v4-flash`，调用前依文档策略检查该模型是否允许接收内容；不能调用则记录原因，不自动改发到未经授权的服务。
+
+视觉转录进入统一 `content.md`，用 `source-map.jsonl` 回链原件。可定位到整页或已知裁剪范围；没有可靠的文字框就不生成字级坐标。路由结果、模型标识、覆盖率和警告写回 manifest 的页级状态。看不清的内容保留待核验；超时或截断按缺失、部分覆盖或失败记录。
+
+视觉转录与视觉增强分开：前者恢复图像中的可见正文；后者是可选的图注或描述，不覆盖原文。
 
 ### 4.3 混合页合并
 
@@ -277,33 +278,22 @@ ParsedDocument:
 
 ### 6.1 W：WeKnora/docreader
 
-接入：
-
 ```text
-原件 → docreader → Markdown + 图片 + SourceBlocks/SourceLocator
-     → Library adapter → revision
+原件 → docreader builtin → 原生文字、基础版面、页图和源定位
+     → Library 逐页判断与合并 → content.md + source-map + assets/tables
+                           └─ 需读图且获准 → Library 视觉模型
 ```
 
-只取：
+| 页的形态 | W 路线如何处理 |
+| --- | --- |
+| 可靠文字层、简单版面 | 使用 docreader 的文字、阅读顺序和可验证的 SourceLocator；不送图。 |
+| 无可靠文字层 | 复用 docreader 渲染的扫描页图和物理页号。Library 检查送模权限后调用视觉模型，转录按页归档。 |
+| 同页印刷文字与手写/图像并存 | 保留可靠原生文字。Library 仅对已定位、未覆盖的区域补读；不把整页转录叠进原文。无法定位缺口时标记待补读。 |
+| 双栏顺序异常、复杂或跨页表格 | 进入复杂版面检查。优先用 Docling 做同页对照；未通过验收前不自动切换。没有可靠结构时保留可核实的文字与原页，标记结构未覆盖。 |
 
-- Markdown 文本；
-- 表格和图片；
-- SourceBlocks 的字符范围；
-- SourceLocator 的 page/bbox/slide/sheet；
-- 覆盖率、警告。
+固定版本的 docreader builtin 以图像面积和文字长度逐页判定 `scanned` 或 `text`，这只是 Library 路由信号，不是混合区域或表格结构的真值。在首轮混合 PDF 中，W 的扫描页仅出图，双栏有同行拼接，表格值可读但未形成网格。因此不得以 W 判为 `text` 就跳过缺口检查，也不能用视觉转录补出未经核实的行列或精确 bbox。
 
-不取：
-
-- WeKnora Knowledge/Chunk 表；
-- WeKnora 的向量/全文索引；
-- WeKnora 应用路由和权限模型。
-
-风险：
-
-- docreader 版本和依赖需要固定；
-- AnyDoc 是否为启用构建需要核实；
-- SourceLocator 的坐标语义必须逐个格式验证；
-- 表格和图片落盘路径需要重映射为 Library asset。
+只取 docreader 可验证的 Markdown、图片、表格、SourceBlocks、SourceLocator 和警告。偏移需按最终 `content.md` 重算；图片要映射为 Library asset。固定 parser 版本和依赖，逐格式核对定位，不假定 AnyDoc 已启用。不接 WeKnora Go 侧 OCR/VLM 后处理、索引、Knowledge/Chunk 或权限模型。
 
 ### 6.2 L：LinkSense/Docling
 
@@ -381,6 +371,8 @@ document_revision
 
 ### 7.2 任务流
 
+以下是完整接入的原始串行方案。摘要和可选索引是否阻塞 active 切换仍待确认；不得把旧版摘要关联到新版正文。首个隔离切片不切换 active 指针，只读取明确指定的 revision。
+
 ```text
 ingest_file
   → 选择路线
@@ -405,9 +397,9 @@ ingest_file
 - 不同配置或不同解析器必须生成新 revision。
 - 任务重试不能产生重复 active revision。
 
-## 8. 双层检索与查询（模块 3，待商榷）
+## 8. 双路检索与查询（模块 3 首期范围已确认）
 
-本设计只记录候选边界，不在本任务实现，也不锁定最终索引方案：
+两个入口可独立使用，不在本任务实现：
 
 ```text
 第一层：summary / metadata / sections → 候选文档和候选页面
@@ -415,12 +407,13 @@ ingest_file
 source-map → PDF页/Word段落/Excel单元/PPT slide
 ```
 
-候选原则：
+首期边界：
 
 - 保留现有摘要/元数据导航和可选摘要向量；
 - `content.md` 作为第二层正文搜索面；
-- 候选 revision 先局部搜索，证据不足时扩大授权范围；
-- 精确匹配/GREP、FTS/BM25、正文向量和 rerank 仍需评测后决定；
+- 主题查询可先搜候选；找精确原文或要求列全时可直接搜用户指定且有权访问的范围，摘要不作硬过滤；
+- 首期支持字面匹配和受控正则；全文 FTS/BM25、正文向量和 rerank 待评测；
+- 接入原文精读并核验引用，报告缺页和未覆盖文档；
 - 内部 segment 可选，必须可重建；
 - `SearchHit` 未来应返回 document、revision、content range、source map、locator 和 assets；
 - 查询不得依赖产品 Chunk ID。
@@ -457,7 +450,7 @@ source-map → PDF页/Word段落/Excel单元/PPT slide
 
 ### 阶段 4：summary 与索引
 
-基于 revision 生成 summary/sections，建 FTS5，验证更换 prompt/embedding 不重新解析。
+基于 revision 生成 summary/sections，验证更换 prompt/embedding 不重新解析。首期独立正文搜索使用字面匹配和受控正则，不以正文 FTS5 为前提。
 
 ### 阶段 5：查看与 Agent
 
