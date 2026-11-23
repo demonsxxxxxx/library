@@ -36,10 +36,12 @@ multiple entries share the prefix.
 """
 from __future__ import annotations
 
+from secrets import token_hex
 from typing import Any, Mapping
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from library.agent.numeric_evidence import SHA256_RE
 from library.agent.read_compression import (
     CompressionSettings,
     compress_read_text,
@@ -68,8 +70,9 @@ _LOCATOR_VALUE_KEYS = {
 SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["requests"],
+    # Some tool providers disallow top-level oneOf. Enforce exclusivity in the handler.
     "properties": {
+        "cursor": {"type": "string", "description": "Resume one issued evidence cursor in this turn; omit requests."},
         "requests": {
             "type": "array",
             "minItems": 1,
@@ -115,6 +118,11 @@ SCHEMA: dict[str, Any] = {
                                 "section_id": {"type": "string"},
                                 "heading": {"type": "string"},
                                 # PDF
+                                "search_from_page": {"type":"integer", "minimum":1, "description":"Resume a windowed prose pattern search with the next_search arguments from its prior result."},
+                                "pdf_text_view": {
+                                    "type": "string", "enum": ["prose"],
+                                    "description": "Native reading order. To find prose in a PDF before knowing its page, set prose and pattern, omit page_start/end. Reopen hits with prose and a single physical page_start. For tables omit the view. Not pixel evidence.",
+                                },
                                 "page_start": {"type": "integer", "minimum": 1},
                                 "page_end": {"type": "integer", "minimum": 1},
                                 "page_label": {
@@ -125,6 +133,19 @@ SCHEMA: dict[str, Any] = {
                                         "Prefer page_start/page_end from prior "
                                         "read_files results when available."
                                     ),
+                                },
+                                "numeric_check": {
+                                    "type": "object", "additionalProperties": False,
+                                    "required": ["locator", "candidate"],
+                                    "description": "PDF only. Check an exact candidate against pixels of one physical page_start, even with a readable text layer.",
+                                    "properties": {
+                                        "locator": {"type": "string", "maxLength": 200,
+                                                    "description": "Location or label only, without the proposed answer."},
+                                        "candidate": {"type": "string", "maxLength": 300,
+                                                      "description": "Exact field including signs, exponents, operands and units as applicable."},
+                                        "region": {"type": "array", "items": {"type": "number", "minimum": 0, "maximum": 1},
+                                                   "minItems": 4, "maxItems": 4, "description": "Optional [left,top,right,bottom] fractions of displayed page."},
+                                    },
                                 },
                                 # DOCX
                                 "paragraph_start": {"type": "integer", "minimum": 1},
@@ -241,6 +262,8 @@ SCHEMA: dict[str, Any] = {
         "and preserved before OCR or vision. For ordinary PDF, DOCX, or PPTX "
         "text, shapes, and tables, omit `question`; for OCR-indexed PDFs, omit "
         "it to read stored OCR text. "
+        "For scientific prose in a selected PDF, first use pdf_text_view=prose + pattern WITHOUT page numbers to find relevant passages. Read the matched physical page with the same prose view. Follow next_search for outstanding windows before claiming completeness; disclose unread pages. "
+        "For critical numeric fields use numeric_check on one PDF page. Resume remaining evidence using cursor alone. "
         "Use AFTER read_entries_metadata identified relevant sections."
     ),
     schema=SCHEMA,
@@ -250,9 +273,15 @@ async def read_files(
     ctx: ToolContext,
     args: Mapping[str, Any],
 ) -> dict[str, Any]:
+    if "cursor" in args:
+        if "requests" in args:
+            return {"ok": False, "error": "Pass cursor or requests, not both"}
+        if ctx.read_delivery is None:
+            return {"ok": False, "error": "Continuation requires the originating agent turn"}
+        return await ctx.read_delivery.resume(db, args["cursor"])
     requests = list(args.get("requests") or [])
     if not requests:
-        return {"ok": True, "results": [], "count": 0}
+        return {"ok": False, "error": "Pass non-empty requests or a continuation cursor"}
 
     # Resolve each entry_id to a full uuid. Accept full ids and short
     # hex prefixes (>= 8 chars). Ambiguous or unknown prefixes get a
@@ -299,6 +328,9 @@ async def read_files(
             continue
         entry, file_row = pair
 
+        if entry.deleted_at is not None or file_row.deleted_at is not None:
+            results.append({"ok": False, "entry_id": eid, "error": "entry no longer live"})
+            continue
         if file_row.ingest_status != "done":
             results.append({
                 "ok": False, "entry_id": eid,
@@ -349,6 +381,14 @@ async def read_files(
             continue
 
         for read_args in expanded_reads:
+            if 'pdf_text_view' in read_args and pipeline.name != 'pdf':
+                result_obj['reads'].append({'ok': False, 'args': read_args, 'error': 'pdf_text_view needs a PDF entry'})
+                any_failed = True
+                continue
+            if "numeric_check" in read_args and pipeline.name != "pdf":
+                result_obj["reads"].append({"ok": False, "args": read_args, "error": "numeric_check needs a live PDF entry"})
+                any_failed = True
+                continue
             seg = await _safe_read_segment(
                 pipeline=pipeline, file_row=file_row,
                 args=dict(read_args), storage=storage,
@@ -362,6 +402,9 @@ async def read_files(
                 any_failed = True
             else:
                 extras = dict(seg.extras or {})
+                if pipeline.name == 'pdf' and '/C0' in seg.text:
+                    extras['numeric_warning'] = ('Ambiguous PDF glyphs. Do not infer a sign or exponent. '
+                                                 'Use numeric_check on the pertinent physical page.')
                 compression = compress_read_text(
                     seg.text,
                     entry_id=eid,
@@ -375,7 +418,12 @@ async def read_files(
                     settings=compression_settings,
                 )
                 entry_dict["text"] = compression.text
-                if compression.compressed:
+                sha = extras.get("file_sha256")
+                if (ctx.read_delivery is not None and extras.get("source") == "pdf_page_pixels"
+                        and extras.get("numeric_status") == "pixel_agreement"
+                        and isinstance(sha, str) and SHA256_RE.fullmatch(sha)):
+                    entry_dict.update(evidence_id=token_hex(16), file_id=file_row.id, text=seg.text)
+                elif compression.compressed:
                     extras["read_compression"] = compression.metadata()
                 if extras:
                     entry_dict["extras"] = extras
@@ -387,11 +435,8 @@ async def read_files(
         results.append(result_obj)
 
     overall_ok = all(r.get("ok") for r in results)
-    return {
-        "ok": overall_ok,
-        "results": results,
-        "count": len(results),
-    }
+    payload = {"ok": overall_ok, "results": results, "count": len(results)}
+    return ctx.read_delivery.start(payload) if ctx.read_delivery is not None else payload
 
 
 def _expand_reads(reads_args: list[Any]) -> list[dict[str, Any]]:

@@ -68,7 +68,7 @@ def prepare_finish_citation_manifest(
         matching_reads = [
             item
             for item in evidence.get(entry_id, [])
-            if quote_matches_source_text(str(item.get("text") or ""), quote)
+            if _matches_read(item, quote)
         ]
         if not matching_reads:
             return [], _citation_error(
@@ -159,10 +159,25 @@ def _read_file_evidence(
             for read in reads:
                 if not isinstance(read, Mapping) or read.get("ok") is False:
                     continue
+                # New pixel evidence is cited through structured numeric_claims.
+                # Do not let a prose citation bypass its version and page checks.
+                if read.get("evidence_id"):
+                    continue
                 text = str(read.get("text") or "").strip()
                 if text:
                     evidence.setdefault(entry_id, []).append(dict(read))
     return evidence
+
+
+def _matches_read(read: Mapping[str, Any], quote: str) -> bool:
+    extras = read.get("extras") or {}
+    if extras.get("source") == "pdf_page_pixels":
+        # A numeric transcription must not pass prose normalization, which
+        # folds superscripts, punctuation and case. Ignore the page header.
+        _, _, field = str(read.get("text") or "").partition("\n")
+        return (extras.get("numeric_status") == "pixel_agreement"
+                and _single_line(field) == quote)
+    return quote_matches_source_text(str(read.get("text") or ""), quote)
 
 
 def _supported_pages(read: Mapping[str, Any], quote: str) -> set[int]:

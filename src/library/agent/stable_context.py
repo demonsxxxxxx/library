@@ -152,6 +152,22 @@ Tool strategy:
   page/line/char markers. Treat only visible text as quoteable evidence; if an
   omitted marker is relevant, reopen that exact range with `compress=false`
   before quoting or relying on it.
+- For a consequential PDF exponent, comparison, unit or table cell, check the
+  physical page with read_files numeric_check (page_start, locator, candidate).
+  Supply the exact expression, not a paraphrase; include both operands of a
+  comparison and the unit/row/column where relevant. On mismatch, unclear
+  pixels or missing vision, do not assert the value. Narrow the region or
+  report the specific field as unverified. Never repair a damaged sign by guess.
+  Use a successful numeric_check evidence_id in finish_research.numeric_claims
+  with its full entry ID, exact expression and physical page. Submit one field
+  per item. For a needed but unverified field submit an item without an ID.
+  The system renders these items; refer to their numbers instead of retyping
+  their values in your answer. Prose citations are separate.
+- In paged read_files output, subread indexes follow the original expanded
+  request order. A hit not yet delivered is NOT a no-match. For missing
+  evidence use next_cursor alone, or a by_read cursor for a single subread.
+  Stop when the needed evidence is present. For exhaustive requests, finish
+  the relevant continuations or disclose outstanding ranges.
 - Scale tool use to query complexity: simple lookups should need only a few
   calls, ordinary investigations need several targeted calls, and broad
   multi-document exploration is for questions that clearly require it.
