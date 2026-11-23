@@ -19,12 +19,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import logging
 import math
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any
 
 from library.agent.compression_adapter import (
@@ -735,6 +738,13 @@ class PdfPipeline(Pipeline):
         storage: StorageBackend,
     ) -> SegmentResult:
         """Read source or stored OCR text before using bounded page vision."""
+        if 'pdf_text_view' in args:
+            if _file_was_ocr_indexed(file_row):
+                return SegmentResult(error='Use the default view for stored PDF OCR text.')
+            body = await self._read_bytes(storage, file_row.storage_key)
+            return await asyncio.to_thread(self._slice_prose, body, args)
+        if 'numeric_check' in args:
+            return await self._check_numeric_pixels(file_row, args, storage)
         is_ocr_pdf = _file_was_ocr_indexed(file_row)
         question = (args.get("question") or "").strip() if isinstance(args, dict) else ""
         pdf_bytes: bytes | None = None
@@ -761,6 +771,65 @@ class PdfPipeline(Pipeline):
             storage=storage,
             pdf_bytes=pdf_bytes,
         )
+
+    async def _check_numeric_pixels(self, file_row, args, storage) -> SegmentResult:
+        """Read one original page independently; never feed the candidate to the visual reader."""
+        page = args.get('page_start')
+        check = args.get('numeric_check')
+        meta = {'source': 'pdf_page_pixels', 'numeric_status': 'unverified',
+                'file_sha256': getattr(file_row, 'sha256', None)}
+
+        def reject(reason):
+            return SegmentResult(error=f'Numeric field unverified: {reason}', extras=meta)
+
+        if (type(page) is not int or page < 1 or args.get('page_end', page) != page
+                or set(args) - {'page_start', 'page_end', 'numeric_check', 'compress'}
+                or not isinstance(check, dict)):
+            return reject('select exactly one physical page and numeric_check')
+        candidate, locator = check.get('candidate'), check.get('locator')
+        if not (isinstance(locator, str) and 0 < len(locator.strip()) <= 200 and
+                isinstance(candidate, str) and 0 < len(candidate.strip()) <= 300):
+            return reject('a short locator and exact candidate are required')
+        region = check.get('region', [0, 0, 1, 1])
+        if (not isinstance(region, list) or len(region) != 4 or
+                not all(type(v) in (float, int) and 0 <= v <= 1 for v in region) or
+                region[0] >= region[2] or region[1] >= region[3]):
+            return reject('invalid normalized page region')
+        meta.update(page_start=page, page_end=page, region=region)
+        if not has_vision_profile():
+            return reject('vision profile not configured')
+        body = await self._read_bytes(storage, file_row.storage_key)
+        if meta["file_sha256"] and hashlib.sha256(body).hexdigest() != meta["file_sha256"]:
+            return reject("PDF bytes do not match the recorded file version")
+        try:
+            jpeg = await asyncio.to_thread(_numeric_region_jpeg, body, page, region)
+            client = get_chat_client('vision')
+            reply = await client.complete(ChatRequest(
+                system=('Transcribe only from the original PDF pixels. The locator is a label, not an answer. '
+                        'Preserve characters, case, superscripts, signs, operand order, units and cell association. '
+                        'If the requested field is ambiguous, incomplete or illegible, return status unclear. '
+                        'Output one JSON object: {"status":"clear" or "unclear", "text":"exact field"}.'),
+                messages=[ChatMessage(role='user', content=[TextBlock(text=locator), ImageBlock(
+                    media_type='image/jpeg', data_b64=base64.b64encode(jpeg).decode('ascii'))])],
+                max_tokens=512, temperature=0.0,
+            ))
+            if reply.stop_reason == 'max_tokens':
+                return reject('incomplete visual transcription')
+            observed = json.loads(reply.text or '')
+        except Exception as exc:
+            log.warning('Numeric PDF pixel check failed on page %d (%s)', page, type(exc).__name__)
+            return reject('page rendering or visual transcription unavailable')
+        if not isinstance(observed, dict) or observed.get('status') != 'clear':
+            return reject('field not clear on selected page/region')
+        value = observed.get('text')
+        if not isinstance(value, str) or not 0 < len(value.strip()) <= 300:
+            return reject('empty or invalid transcription')
+        # No NFKC, punctuation removal or fuzzy matching: e.g. 10² is not 102.
+        if ' '.join(value.split()) != ' '.join(candidate.split()):
+            meta.update(numeric_status='disagreement', pixel_transcription=value)
+            return reject('candidate disagrees with the page; inspect or narrow the region')
+        meta.update(numeric_status='pixel_agreement', vlm_used=True)
+        return SegmentResult(text=f'[Page {page}]\n{value.strip()}', extras=meta)
 
     async def _answer_with_vlm(
         self,
@@ -1049,7 +1118,56 @@ class PdfPipeline(Pipeline):
         returns an actionable error suggesting `question` for VLM-based
         reading instead of the opaque "empty result".
         """
+        if 'pdf_text_view' in args:
+            return self._slice_prose(pdf_bytes, args)
         return self._slice_text_layer(pdf_bytes, args, file_row=file_row)
+
+    def _slice_prose(self, body: bytes, args: dict[str, Any]) -> SegmentResult:
+        """Bounded alternate text-layer view, never a table or pixel transcription."""
+        page_no = args.get('page_start')
+        if page_no is None and ('pattern' in args or 'search_from_page' in args):
+            from .prose_window_trial import search
+            return search(body, args, _pdfium_document)
+        if 'search_from_page' in args:
+            return SegmentResult(error='Use search_from_page only with document prose search.')
+        if (args.get('pdf_text_view') != 'prose' or type(page_no) is not int or page_no < 1
+                or args.get('page_end', page_no) != page_no or 'page_label' in args
+                or 'question' in args or 'numeric_check' in args):
+            return SegmentResult(error='pdf_text_view=prose requires one physical page_start; '
+                                 'omit page_label, question and numeric_check.')
+        extras = {'pdf_text_view': 'prose', 'page_start': page_no, 'page_end': page_no}
+        try:
+            with _pdfium_document(body) as doc:
+                total = len(doc)
+                if page_no > total:
+                    return SegmentResult(error='Requested prose page outside PDF', extras=extras)
+                page = doc[page_no - 1]
+                try:
+                    textpage = page.get_textpage()
+                    try:
+                        text = textpage.get_text_bounded().replace('\r\n', '\n').strip()
+                    finally:
+                        textpage.close()
+                finally:
+                    page.close()
+        except Exception as exc:
+            return SegmentResult(error=f'PDF prose read failed ({type(exc).__name__}).', extras=extras)
+        extras['total_pages'] = total
+        if not text:
+            return SegmentResult(error='No readable native prose on this page.', extras=extras)
+        pattern = (args.get('pattern') or '').strip()
+        if pattern:
+            result = _pdf_pattern_search(
+                pages=[text], pattern=pattern, context_lines=_int_arg(args.get('context_lines'), default=2, minimum=0),
+                max_matches=_int_arg(args.get('max_matches'), default=20, minimum=1),
+                match_offset=_int_arg(args.get('match_offset'), default=0, minimum=0),
+                page_offset=page_no - 1, total_pages_full=total,
+            )
+            result.extras.update(extras)
+            return result
+        return _clamp_pdf(f'[Page {page_no}]\n{text}', _int_arg(args.get('offset'), default=0, minimum=0),
+                          _int_arg(args.get('max_chars'), default=self.READ_DEFAULT_MAX_CHARS, minimum=1),
+                          extras=extras)
 
     def _slice_text_layer(
         self,
@@ -1820,6 +1938,17 @@ async def _ocr_pdf_pages(pdf_bytes: bytes, total_pages: int) -> list[str]:
     return out
 
 
+_PDFIUM_LOCK = Lock()  # PDFium is not thread safe, even for independent documents.
+
+
+@contextmanager
+def _pdfium_document(body: bytes):
+    import pypdfium2 as pdfium
+
+    with _PDFIUM_LOCK, pdfium.PdfDocument(body) as doc:
+        yield doc
+
+
 def _render_pdf_pages_to_jpeg(
     pdf_bytes: bytes,
     page_count: int,
@@ -1830,11 +1959,8 @@ def _render_pdf_pages_to_jpeg(
     """Render `page_count` pages to JPEG bytes. Sync, intended to run
     inside asyncio.to_thread. Mirrors WeKnora's PDFScannedParser shape:
     pypdfium2 → PIL.Image → JPEG via Pillow."""
-    import pypdfium2 as pdfium
-
     out: list[bytes] = []
-    pdf = pdfium.PdfDocument(pdf_bytes)
-    try:
+    with _pdfium_document(pdf_bytes) as pdf:
         start = max(0, start_page)
         end = min(start + page_count, len(pdf))
         for i in range(start, end):
@@ -1845,23 +1971,34 @@ def _render_pdf_pages_to_jpeg(
                 close = getattr(page, "close", None)
                 if close:
                     close()
-    finally:
-        close = getattr(pdf, "close", None)
-        if close:
-            close()
     return out
+
+
+def _numeric_region_jpeg(body: bytes, page_no: int, region: list[float]) -> bytes:
+    with _pdfium_document(body) as doc:
+        if not 1 <= page_no <= len(doc):
+            raise ValueError('physical page outside document')
+        page = doc[page_no - 1]
+        try:
+            width, height = page.get_size()
+            left, top, right, bottom = region
+            crop = (width * left, height * (1 - bottom), width * (1 - right), height * top)
+            return _render_pdf_page_to_vision_jpeg(page, crop=crop)
+        finally:
+            page.close()
 
 
 def _render_pdf_page_to_vision_jpeg(
     page: Any,
     *,
     max_dpi: float = PDF_VISION_MAX_DPI,
+    crop: tuple[float, float, float, float] | None = None,
 ) -> bytes:
     scale = _pdf_vision_render_scale(page, max_dpi=max_dpi)
     bitmap = None
     image = None
     try:
-        bitmap = page.render(scale=scale)
+        bitmap = page.render(scale=scale, **({'crop': crop} if crop else {}))
         image = bitmap.to_pil()
         image.load()
         return _encode_pdf_vision_jpeg(image, effective_dpi=scale * 72.0)

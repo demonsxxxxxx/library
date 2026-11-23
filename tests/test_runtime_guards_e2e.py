@@ -703,6 +703,54 @@ async def test_finalizing_attaches_validated_citation_manifest() -> None:
     print("[5] finalizing attached validated citation definitions before display")
 
 
+async def test_final_request_recovers_dropped_read_and_exact_current_question(monkeypatch) -> None:
+    from library.config import ModelCapabilities
+    from library.llm.types import ToolResultBlock, ToolUseBlock
+
+    question = 'Read the document. ' + 'Background detail. ' * 160 + 'Report the quartz gauge reading.'
+    measured = 'The quartz gauge reading was 76 units at inspection.'
+    sid = await _open_session(question)
+    eid = await _seed_citation_entry()
+
+    class LongRead(_CitingReadTool):
+        async def handler(self, db, ctx, arguments):
+            packet = await super().handler(db, ctx, arguments)
+            packet['results'][0]['reads'][0]['text'] = 'ordinary material. ' * 1200 + measured
+            return packet
+
+    _install_tool(LongRead(eid), explicit_finalization=True)
+    from library.llm.types import ToolDef
+    defs = [ToolDef(**item) for item in runtime.all_tool_defs()]
+    monkeypatch.setattr(runtime, 'all_tool_defs', lambda: defs)
+    def reply(text=None, calls=()):
+        return ChatResponse(text=text, tool_calls=list(calls), stop_reason='tool_use' if calls else 'end_turn', usage=TokenUsage())
+    chat = _ScriptedChat([
+        reply('Read the source.'),
+        reply(calls=[ToolCall('r1', 'read_files', {'requests': [{'entry_id': eid}]})]),
+        reply(calls=[ToolCall('f1', 'finish_research', {'evidence_status': 'insufficient', 'reason': 'test'})]),
+        reply('Bounded answer.'),
+    ])
+    chat.capabilities = ModelCapabilities(context_window=23_000, tokenizer='utf8_upper_bound')
+    _install_chat(chat)
+    events = await _drive(sid, question)
+    assert any(e == 'answer' for e, _ in events), [e for e, _ in events]
+    final = chat.requests[-1]
+    assert any(m.role == 'user' and m.content == question for m in final.messages)
+    calls = [b.id for m in final.messages if isinstance(m.content, list) for b in m.content if isinstance(b, ToolUseBlock)]
+    reads = [b for m in final.messages if m.role == 'tool' for b in m.content if isinstance(b, ToolResultBlock) and b.tool_call_id == 'r1']
+    assert calls.count('r1') == len(reads) == 1
+    assert measured in reads[0].content
+    assert len(reads[0].content) < 8000  # bounded excerpts, not the original 22k result
+    # Serialize the actual final request using each production adapter, offline.
+    from library.llm.openai_adapter import OpenAIChatClient
+    from library.llm.anthropic_adapter import AnthropicChatClient
+    wire = OpenAIChatClient.__new__(OpenAIChatClient)._render_messages(final)
+    assert any(m.get('tool_call_id') == 'r1' and measured in m['content'] for m in wire if m['role'] == 'tool')
+    wire = AnthropicChatClient.__new__(AnthropicChatClient)._render_messages(final)
+    assert any(b.get('tool_use_id') == 'r1' and measured in b['content']
+               for m in wire for b in m['content'] if b['type'] == 'tool_result')
+
+
 # ---- 6. canonical args (json.dumps sort_keys) ------------------------------
 
 def test_canonical_args() -> None:
@@ -744,6 +792,10 @@ async def main() -> None:
     await test_doom_loop_nudge()
     await test_final_answer_continuation_is_buffered()
     await test_finalizing_attaches_validated_citation_manifest()
+    from pytest import MonkeyPatch
+
+    with MonkeyPatch.context() as monkeypatch:
+        await test_final_request_recovers_dropped_read_and_exact_current_question(monkeypatch)
     print("\nALL RUNTIME-GUARD TESTS PASSED")
 
 

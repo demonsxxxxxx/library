@@ -188,6 +188,57 @@ def test_pdf_layout_extraction_keeps_table_row_headers_with_cells() -> None:
     assert "H8830 | Message | Driver not connected." in seg.text
 
 
+def test_prose_read_and_search_use_the_same_bounded_text_view() -> None:
+    body = _build_text_pdf(3)
+    args = {'pdf_text_view': 'prose', 'page_start': 2}
+    pipeline = PdfPipeline()
+    read = pipeline._slice(body, args)
+    assert read.error is None and read.extras['pdf_text_view'] == 'prose'
+    assert 'Unique token p002' in read.text and 'p001' not in read.text
+    search = pipeline._slice(body, {**args, 'pattern': 'Unique token p002'})
+    assert search.error is None and search.extras['pdf_text_view'] == 'prose'
+    assert 'Unique token p002' in search.text and search.extras['hits'][0]['page'] == 2
+    head = pipeline._slice(body, {**args, 'max_chars': 12})
+    tail = pipeline._slice(body, {**args, 'offset': head.extras['next_offset']})
+    assert head.text + tail.text == read.text
+    assert 'numeric_status' not in read.extras and 'evidence_id' not in read.extras
+    for bad in ({}, {'page_start': 4}, {'page_start': 1, 'page_end': 2}, {'page_start': 0},
+                {'page_start': 2, 'numeric_check': {}}, {'page_start': 2, 'question': 'Inspect'}):
+        assert pipeline._slice(body, {'pdf_text_view': 'prose', **bad}).error
+
+
+def test_document_prose_search_reports_partial_miss_and_resumes() -> None:
+    body = _build_text_pdf(12)
+    pipeline = PdfPipeline()
+    miss = pipeline._slice(body, {"pdf_text_view": "prose", "pattern": "Unique token p012"})
+    assert miss.error and "not proof of absence" in miss.error
+    assert miss.extras["coverage"] == "partial"
+    assert miss.extras["window_end"] == 8
+
+    hit = pipeline._slice(body, miss.extras["next_search"])
+    assert hit.error is None and hit.extras["window_start"] == 9
+    assert "next_search" not in hit.extras
+    [match] = hit.extras["hits"]
+    assert match["page"] == 12
+    page = pipeline._slice(body, {"pdf_text_view": "prose", "page_start": match["page"]})
+    raw = page.text.split("\n", 1)[1]
+    assert raw[match["raw_start"]:match["raw_end"]] == "Unique token p012"
+    assert raw[match["excerpt_start"]:match["excerpt_end"]] in hit.text
+
+
+def test_document_prose_search_preserves_original_wrap_and_paginates_matches() -> None:
+    body = _build_text_pdf(3)
+    pipeline = PdfPipeline()
+    args = {"pdf_text_view": "prose", "pattern": r"page \d+ Unique token", "max_matches": 1}
+    for expected in range(1, 4):
+        result = pipeline._slice(body, args)
+        assert result.error is None
+        assert [hit["page"] for hit in result.extras["hits"]] == [expected]
+        assert f"page {expected}\nUnique token" in result.text
+        args = result.extras.get("next_search")
+    assert args is None
+
+
 def test_pdf_default_read_is_windowed_for_long_documents() -> None:
     pdf_bytes = _build_text_pdf(30)
     seg = PdfPipeline()._slice(pdf_bytes, {})

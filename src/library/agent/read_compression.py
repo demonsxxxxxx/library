@@ -135,7 +135,7 @@ def compress_read_text(
 
 
 def _is_precision_read(args: dict[str, Any], extras: dict[str, Any]) -> bool:
-    if args.get("question") or extras.get("vlm_used"):
+    if args.get("pdf_text_view") == "prose" or args.get("question") or extras.get("vlm_used"):
         return True
     if args.get("pattern") or args.get("patterns") or extras.get("hits"):
         return True

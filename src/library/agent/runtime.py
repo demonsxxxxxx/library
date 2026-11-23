@@ -58,6 +58,14 @@ from typing import Any, AsyncIterator, Literal, Mapping, Sequence
 
 from library.agent.compression_adapter import maybe_compress_tool_result_for_model
 from library.agent.cache_metrics import summarize_llm_calls
+from library.agent.live_turn_context import fit_live_turn
+from library.agent.numeric_evidence import (
+    attach_numeric_claims,
+    is_numeric_marker,
+    matches_file_version,
+    receive_numeric_evidence,
+)
+from library.agent.read_delivery import MAX_TOOL_RESULT_LEN, ReadDelivery
 from library.agent.conversation_compaction import (
     TokenCounter,
     fit_messages_to_token_budget,
@@ -119,7 +127,6 @@ from library.agent import tool_display
 
 log = logging.getLogger(__name__)
 
-MAX_TOOL_RESULT_LEN = 50_000
 QUICK_EXECUTE_MAX_TURNS = 4
 STANDARD_EXECUTE_MAX_TURNS = 8
 AUTO_MAX_BUDGET_UPGRADES = 2
@@ -187,7 +194,9 @@ FINALIZE_RESEARCH_NUDGE = (
     "If finish_research returned a citation_manifest, place its assigned markers "
     "after the corresponding supported claims and do not recreate their footnote "
     "definitions; the runtime appends them deterministically. If no manifest was "
-    "returned, follow the ordinary citation contract. Return the entire answer body."
+    "returned, follow the ordinary citation contract. If numeric_results were returned, "
+    "refer to their item numbers when needed; do not retype their expressions or "
+    "create numeric footnotes. The runtime appends those items. Return the entire answer body."
 )
 FINALIZATION_RETRY_NUDGE = (
     "[runtime guard] The previous finalizing response was not a valid complete "
@@ -519,6 +528,7 @@ class _DispatchStats:
     finish_research_requested: bool = False
     evidence_status: str | None = None
     citation_manifest: list[dict[str, Any]] | None = None
+    numeric_results: list[dict[str, Any]] | None = None
 
 
 @dataclass(slots=True)
@@ -1423,6 +1433,7 @@ def _fit_provider_messages(
     max_tokens: int,
     tools: list[Any] | None,
     preserved_prefix_count: int = 0,
+    current_question: ChatMessage | None = None,
 ) -> tuple[list[ChatMessage], dict[str, Any]]:
     """Fit one provider request to the resolved model's hard context limit.
 
@@ -1470,11 +1481,15 @@ def _fit_provider_messages(
         )
 
     tokens_before = counter.messages(messages)
-    fitted, checkpoint = fit_messages_to_token_budget(
-        dynamic,
-        token_budget=dynamic_budget,
-        counter=counter,
-    )
+    replayed = 0
+    if current_question is not None and tokens_before > message_budget:
+        fitted, checkpoint, replayed = fit_live_turn(
+            dynamic, current_question, token_budget=dynamic_budget, counter=counter,
+        )
+    else:
+        fitted, checkpoint = fit_messages_to_token_budget(
+            dynamic, token_budget=dynamic_budget, counter=counter,
+        )
     result = [*prefix, *fitted]
     tokens_after = counter.messages(result)
     return result, {
@@ -1482,6 +1497,7 @@ def _fit_provider_messages(
         "conversation_tokens_before": tokens_before,
         "conversation_tokens_after": tokens_after,
         "conversation_token_budget": message_budget,
+        "conversation_replayed_read_exchanges": replayed,
         "conversation_tokenizer": counter.tokenizer,
         "conversation_exact_token_count": counter.exact,
         "conversation_checkpoint_summary_tokens": (
@@ -1949,6 +1965,7 @@ async def _rewrite_footnotes_for_display(
     *,
     locate_pdf_quotes: bool = True,
     resolve_pdf_page_labels: bool = True,
+    numeric_results: Sequence[Mapping[str, Any]] = (),
 ) -> str:
     """Resolve `[^a]: entry_id=<uuid>, quote="...", page=N - reason` defs to
     file-type-aware links with exact PDF and Office locators for live rendering.
@@ -1990,6 +2007,8 @@ async def _rewrite_footnotes_for_display(
         log.exception("footnote rewrite: entry lookup failed; keeping raw form")
         return answer
 
+    numeric_by_marker = {item['marker']: item for item in numeric_results
+                         if item.get('status') == 'verified'}
     located_pdf_pages: dict[int, int] = {}
     located_pdf_quotes: set[int] = set()
     located_docx_blocks: dict[int, int] = {}
@@ -2005,6 +2024,10 @@ async def _rewrite_footnotes_for_display(
         file = file_by_id.get(full_eid)
         quote = footnote.quote
         page = footnote.page
+        if is_numeric_marker(footnote.marker):
+            # A physical page from pixel evidence must not be mapped via PDF
+            # printed labels or relocated by a damaged text-layer quote.
+            continue
         if _is_pdf_file(file):
             located = None
             if locate_pdf_quotes and quote:
@@ -2050,6 +2073,15 @@ async def _rewrite_footnotes_for_display(
         full_eid = resolved.get(raw_eid, raw_eid)
         short = full_eid[:8]
         name = name_by_id.get(full_eid)
+        if is_numeric_marker(marker):
+            source = numeric_by_marker.get(marker)
+            file = file_by_id.get(full_eid)
+            if (source and name and source['entry_id'] == full_eid and _is_pdf_file(file)
+                    and str(source['page']) == page and matches_file_version(source, file)
+                    and quote is not None and _unescape_quote(quote) == source['quote']):
+                qs = _citation_query_string([('page', source['page'])])
+                return f"[^{marker}]: [{_escape_markdown_label(name)}](entry:{full_eid}{qs})"
+            return f"[^{marker}]: (original PDF version unavailable)"
         if name is None:
             head = f"(entry {short} unavailable)"
         else:
@@ -2127,8 +2159,10 @@ async def _run_execute_phase(
         session_id=session_id,
         conversation_id=conversation_id,
         user_message=user_message,
+        read_delivery=ReadDelivery(),
     )
     guard = _CallGuard()
+    question_message = ChatMessage(role="user", content=_current_user_content(user_message, images))
 
     messages: list[ChatMessage] = (
         list(prefix_messages or [])
@@ -2136,7 +2170,7 @@ async def _run_execute_phase(
         + [
             # ImageBlocks attach ONLY to this current-turn user message.
             # Prior turns replayed via resumed_history stay text-only.
-            ChatMessage(role="user", content=_current_user_content(user_message, images)),
+            question_message,
             ChatMessage(role="assistant", content=(
                 "Plan prepared:\n"
                 + (plan_text or "(no specific plan; answer directly)")
@@ -2173,6 +2207,7 @@ async def _run_execute_phase(
     finalization_attempts = 0
     finalization_prompt_added = False
     citation_manifest: list[dict[str, Any]] = []
+    numeric_results: list[dict[str, Any]] = []
     prefix_tracker = PromptPrefixTracker()
     execute_system_prompt = _execute_system_prompt_with_budget(
         system_prompt,
@@ -2183,12 +2218,15 @@ async def _run_execute_phase(
     def enter_finalizing(
         *,
         manifest: list[dict[str, Any]] | None = None,
+        numbers: list[dict[str, Any]] | None = None,
     ) -> None:
         nonlocal answer_phase, finalization_prompt_added
-        nonlocal citation_manifest
+        nonlocal citation_manifest, numeric_results
         answer_phase = "finalizing"
         if manifest is not None:
             citation_manifest = list(manifest)
+        if numbers is not None:
+            numeric_results = list(numbers)
         if not finalization_prompt_added:
             messages.append(ChatMessage(role="user", content=FINALIZE_RESEARCH_NUDGE))
             finalization_prompt_added = True
@@ -2279,6 +2317,7 @@ async def _run_execute_phase(
             max_tokens=settings.agent_execute_max_tokens,
             tools=request_tools,
             preserved_prefix_count=len(prefix_messages or []),
+            current_question=question_message,
         )
         if compaction_metrics["conversation_compacted"]:
             # Adopt the checkpoint as this turn's in-memory provider view.
@@ -2460,6 +2499,7 @@ async def _run_execute_phase(
             if dispatch_stats.finish_research_requested:
                 enter_finalizing(
                     manifest=dispatch_stats.citation_manifest,
+                    numbers=dispatch_stats.numeric_results,
                 )
                 continue
             if (
@@ -2547,10 +2587,11 @@ async def _run_execute_phase(
                         yield AgentEvent(event_type="error", data=outcome.error)
                         return
                     answer = attach_citation_manifest(answer, citation_manifest)
+                    answer = attach_numeric_claims(answer, numeric_results)
                 outcome.answer = answer
                 yield AgentEvent(
                     event_type="answer",
-                    data=await _rewrite_footnotes_for_display(answer),
+                    data=await _rewrite_footnotes_for_display(answer, numeric_results=numeric_results),
                 )
                 return
             if resp.stop_reason == "max_tokens":
@@ -2656,10 +2697,11 @@ async def _run_execute_phase(
                     yield AgentEvent(event_type="error", data=outcome.error)
                     return
                 answer = attach_citation_manifest(answer, citation_manifest)
+                answer = attach_numeric_claims(answer, numeric_results)
             outcome.answer = answer
             yield AgentEvent(
                 event_type="answer",
-                data=await _rewrite_footnotes_for_display(answer),
+                data=await _rewrite_footnotes_for_display(answer, numeric_results=numeric_results),
             )
             return
         if resp.stop_reason == "max_tokens":
@@ -2885,6 +2927,17 @@ def _finish_research_preflight(
         None,
     )
     if latest_read is None or not _persisted_tool_call_failed(latest_read):
+        return None
+    claims = tool_call.arguments.get("numeric_claims")
+    latest_args = latest_read.get("arguments")
+    requests = latest_args.get("requests") if isinstance(latest_args, Mapping) else None
+    if isinstance(claims, list) and claims and isinstance(requests, list) and requests and all(
+        isinstance(req, Mapping) and isinstance(reads := req.get("reads"), list) and reads
+        and all(isinstance(read, Mapping) and "numeric_check" in read for read in reads)
+        for req in requests
+    ):
+        # This failed read is a discrete numeric field, not a blanket reason
+        # to discard the other independently supported claims in this turn.
         return None
     return {
         "error": (
@@ -3359,7 +3412,7 @@ async def _dispatch_tool_calls(
                 ):
                     stats.finish_research_requested = True
                     stats.evidence_status = str(
-                        tc.arguments.get("evidence_status") or ""
+                        result_for_model_source.get("evidence_status") or ""
                     ) or None
                     raw_manifest = result_for_model_source.get("citation_manifest")
                     stats.citation_manifest = (
@@ -3371,6 +3424,7 @@ async def _dispatch_tool_calls(
                         if isinstance(raw_manifest, list)
                         else []
                     )
+                    stats.numeric_results = result_for_model_source.get("numeric_results") or []
                 compressed_for_model = maybe_compress_tool_result_for_model(
                     tc.name,
                     result_for_model_source,
@@ -3541,9 +3595,11 @@ async def _dispatch_tool_calls(
             )
 
     # ---- finalize: source-order result_blocks + doom-loop nudge ----
-    for ph in placeholders:
+    for tc, ph in zip(tool_calls, placeholders, strict=True):
         if ph is not None:
             result_blocks.append(ph)
+            if tc.name == "read_files" and not ph.is_error:
+                receive_numeric_evidence(ph.content, ctx.numeric_evidence)
 
     if nudge_pending and result_blocks:
         # Decorate the last real tool_result with the STOP nudge. We

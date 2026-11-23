@@ -400,6 +400,13 @@ async def session_messages(
         if "attached]" in (c.user_message or ""):
             attachments = list_turn_attachments(c.id)
 
+        numeric_results = next((
+            call["result"].get("numeric_results", [])
+            for call in reversed(c.tool_calls or [])
+            if isinstance(call, dict) and call.get("name") == "finish_research"
+            and not call.get("error") and isinstance(call.get("result"), dict)
+            and call["result"].get("ok") is True
+        ), [])
         cache_metrics = _cache_metric_fields([
             call for call in (c.llm_calls or []) if isinstance(call, dict)
         ])
@@ -417,6 +424,7 @@ async def session_messages(
                     c.agent_response,
                     locate_pdf_quotes=False,
                     resolve_pdf_page_labels=False,
+                    numeric_results=numeric_results,
                 )
                 if c.agent_response else c.agent_response
             ),

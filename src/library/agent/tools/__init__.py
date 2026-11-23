@@ -14,11 +14,12 @@ to trigger registration.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Literal, Mapping, MutableMapping
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from library.agent.read_delivery import ReadDelivery
 from library.llm import ToolDef
 
 
@@ -27,6 +28,9 @@ class ToolContext:
     session_id: str
     conversation_id: str
     user_message: str = ""
+    # Stateless callers (MCP, legacy probes) have no turn to resume.
+    read_delivery: ReadDelivery | None = None
+    numeric_evidence: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
