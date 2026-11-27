@@ -24,6 +24,7 @@ from library.api.routes_file_entries import router as file_entries_router
 from library.api.routes_files import router as files_router
 from library.api.routes_folders import router as folders_router
 from library.api.routes_mcp import router as mcp_router
+from library.api.routes_pdf_revisions import router as pdf_revisions_router
 from library.api.routes_semantic_index import router as semantic_index_router
 from library.api.routes_settings import router as settings_router
 from library.api.routes_stats import router as stats_router
@@ -317,6 +318,7 @@ V1_PREFIX = "/v1"
 app.include_router(folders_router, prefix=V1_PREFIX)
 app.include_router(file_entries_router, prefix=V1_PREFIX)
 app.include_router(files_router, prefix=V1_PREFIX)
+app.include_router(pdf_revisions_router, prefix=V1_PREFIX)
 app.include_router(upload_router, prefix=V1_PREFIX)
 app.include_router(user_files_router, prefix=V1_PREFIX)
 app.include_router(webdav_sync_router, prefix=V1_PREFIX)

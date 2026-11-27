@@ -25,6 +25,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
+from library.config import get_settings
 from library.db.models import (
     Catalog,
     EntryTag,
@@ -139,8 +140,29 @@ async def handle_ingest_file(payload: Mapping[str, Any]) -> None:
     # --- phase 2: pipeline -------------------------------------------------
     try:
         await check_ingest_delivery()
+        settings = get_settings()
+        external_pdf = settings.pdf_ingest_parser == "weknora-builtin" and pipeline.name == "pdf"
+        office_format = None
+        if settings.office_ingest_parser in {"anydoc", "docling-office", "weknora-builtin"}:
+            office_format = {"docx":"docx", "spreadsheet":"xlsx", "pptx":"pptx"}.get(pipeline.name)
+            if ((settings.office_ingest_parser == "docling-office" and office_format not in settings.office_docling_formats)
+                    or (ctx.original_ext or "").lower().lstrip(".") != office_format):
+                office_format = None  # Macro/legacy formats retain their old handler.
+        if office_format or external_pdf or (settings.document_revision_ingest_enabled and pipeline.name in {"pdf", "docx"}):
+            from library.document_revisions.ingest import archive_delivery
+            with measure_stage("revision_archive"):
+                ref = await archive_delivery(ctx, entry_id, office_format or pipeline.name, storage, payload.get("_task_id"),
+                                             use_weknora=external_pdf, use_office=bool(office_format))
+            await check_ingest_delivery()
         with measure_stage("pipeline_total"):
-            result = await pipeline.run(ctx=ctx, storage=storage)
+            if office_format:
+                from library.document_revisions.office import index_office_revision
+                result = await index_office_revision(ctx, ref, office_format)
+            elif external_pdf:
+                from library.document_revisions.pdf_index import index_pdf_revision
+                result = await index_pdf_revision(ctx, ref, pipeline)
+            else:
+                result = await pipeline.run(ctx=ctx, storage=storage)
     except Exception:
         await _mark_failed(file_id, reason="pipeline_exception")
         raise
