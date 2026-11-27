@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from weakref import WeakKeyDictionary
 
@@ -29,10 +32,27 @@ _pools: WeakKeyDictionary[asyncio.AbstractEventLoop, _ProviderClientPool] = (
 )
 
 
+_send_check: ContextVar[Callable[[httpx.Request], Awaitable[None]] | None] = ContextVar(
+    "provider_send_check", default=None,
+)
+
+
+@contextmanager
+def provider_send_check(check: Callable[[httpx.Request], Awaitable[None]]):
+    """Attach a request-specific authorization fence, including SDK retries/redirects."""
+    token = _send_check.set(check)
+    try:
+        yield
+    finally:
+        _send_check.reset(token)
+
+
 async def _check_ingest_request(_request: httpx.Request) -> None:
     # HTTP hooks run for SDK-internal retries too, not just the first call.
     from library.tasks.ingest_guard import check_ingest_delivery
     await check_ingest_delivery()
+    if check := _send_check.get():
+        await check(_request)
 
 
 def _current_pool() -> _ProviderClientPool:

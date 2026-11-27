@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 log = logging.getLogger(__name__)
@@ -19,6 +19,12 @@ LlmProvider = Literal["openai", "openai-compatible", "anthropic"]
 #                        response_format={"type":"json_object"} is supported,
 #                        so the adapter injects the schema as text instead.
 # "anthropic"         -> Anthropic Messages API.
+
+
+class VisionDestination(BaseModel):
+    provider: LlmProvider
+    model: str
+    base_url: str | None = None
 
 
 class Settings(BaseSettings):
@@ -35,7 +41,33 @@ class Settings(BaseSettings):
     library_api_token: str | None = None
     library_api_host: str = "127.0.0.1"
     library_api_port: int = 8000
+    # Opt-in ingest archival of native PDF/DOCX, independent of the PDF viewer and LLM.
+    document_revision_ingest_enabled: bool = False
+    # Selecting an external parser replaces PDF ingest extraction, independently of the viewer.
+    document_ingest_parser: Literal["configured", "weknora"] = "configured"
+    pdf_ingest_parser: Literal["library", "weknora-builtin"] = "library"
+    # Server-side opt-in: sends selected pages only to the configured OCR endpoint.
+    pdf_revision_paddle_ocr_enabled: bool = False
+    pdf_revision_paddle_ocr_endpoint: str = ""
+    office_ingest_parser: Literal["library", "docling-office", "anydoc", "weknora-builtin"] = "library"
+    office_docling_formats: set[Literal["docx", "xlsx", "pptx"]] = Field(default_factory=lambda: {"docx", "xlsx", "pptx"})
+    office_docling_python: str = ""
+    office_anydoc_python: str = ""
+    pdf_revision_viewer_enabled: bool = False
+    pdf_revision_weknora_python: str = ""
+    pdf_revision_weknora_source: str = ""
+    pdf_revision_docling_python: str = ""
+    pdf_revision_hf_cache: str = ""
+    # Server-owned allowlist; a GUI checkbox alone does not authorize sending bytes.
+    pdf_revision_vision_grants: dict[str, VisionDestination] = Field(default_factory=dict)
     readiness_timeout_seconds: float = Field(default=2.0, ge=0.1, le=30.0)
+
+    @model_validator(mode="after")
+    def apply_document_parser(self) -> Settings:
+        if self.document_ingest_parser == "weknora":
+            self.pdf_ingest_parser = self.office_ingest_parser = "weknora-builtin"
+            self.pdf_revision_paddle_ocr_enabled = True
+        return self
 
     # Single root for all on-disk state (db, library, caches). Default
     # is ~/LibraryData. Per-component overrides below take precedence

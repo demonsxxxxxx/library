@@ -323,6 +323,27 @@ class PdfPipeline(Pipeline):
                 ocr_document_type=ocr_document_type,
             )
 
+    async def index_revision_pages(self, ctx: PipelineContext, pages: list[str], coverage: dict[str, Any]) -> PipelineResult:
+        """Index verified component text. No storage, extraction, OCR or figure calls here."""
+        index = self._run_chunked_index if self._needs_chunked_index(pages, []) else self._run_single_index
+        with measure_stage("intelligence"):
+            return await index(ctx=ctx, text_per_page=pages, described=[], total_pages=len(pages),
+                               indexed_pages=coverage["indexed_pages"], partial_reasons=coverage["partial_reasons"],
+                               ocr_used=False, ocr_pages_done=0, revision_coverage=coverage)
+
+    @staticmethod
+    def _revision_sections(pages: list[str], coverage: dict[str, Any]) -> list[dict[str, Any]]:
+        # A missing middle page cannot be represented by a 1..processed prefix.
+        failed = set(coverage["failed_pages"])
+        return [fallback_section(title=f"Page {n}", anchor_unit="pages", anchor_value=str(n), summary=text[:160])
+                for n, text in enumerate(pages, 1) if n not in failed]
+
+    @staticmethod
+    def _merge_revision_coverage(indexed: dict[str, Any], parsed: dict[str, Any]) -> None:
+        reasons = list(dict.fromkeys([*indexed["partial_reasons"], *parsed["partial_reasons"]]))
+        partial = indexed["indexed_partial"] or parsed["indexed_partial"]
+        indexed.update(parsed, partial_reasons=reasons, indexed_partial=partial)
+
     @staticmethod
     async def _read_bytes(
         storage: StorageBackend, key: str,
@@ -359,6 +380,7 @@ class PdfPipeline(Pipeline):
         partial_reasons: list[str],
         ocr_pages: list[str] | None = None,
         ocr_document_type: str | None = None,
+        revision_coverage: dict[str, Any] | None = None,
     ) -> PipelineResult:
         body_text_raw = render_pages_with_figures(text_per_page, described)
         body_text = self._truncate(body_text_raw)
@@ -376,6 +398,8 @@ class PdfPipeline(Pipeline):
                 if ocr_used else PDF_TEXT_MAX_INDEX_PAGES
             ),
         )
+        if revision_coverage:
+            self._merge_revision_coverage(coverage, revision_coverage)
         body_for_index, compression_meta = maybe_compress_ingest_view(
             body_text,
             kind="pdf",
@@ -385,12 +409,13 @@ class PdfPipeline(Pipeline):
             coverage["compression"] = compression_meta
 
         user_payload = {
+            **({"revision_coverage": revision_coverage} if revision_coverage else {}),
             "folder_path": ctx.folder_path,
             "sibling_names": ctx.sibling_names,
             "catalog_sketch": ctx.catalog_sketch,
             "tag_vocabulary": ctx.tag_vocabulary,
             "page_count": total_pages,
-            "indexed_pages": indexed_pages,
+            "indexed_pages": coverage["indexed_pages"],
             "figure_count": len(described),
             "ocr_used": ocr_used,
             "ocr_pages_done": ocr_pages_done if ocr_used else 0,
@@ -425,7 +450,11 @@ class PdfPipeline(Pipeline):
                 (resp.text or "")[:300],
             )
             raise ValueError("pdf pipeline produced empty summary")
-        sections = fields.sections or [
+        if revision_coverage:
+            sections = self._revision_sections(text_per_page, revision_coverage)
+        else:
+            sections = fields.sections
+        sections = sections or [
             fallback_section(
                 title=f"Pages 1-{max(indexed_pages, 1)}",
                 anchor_unit="pages",
@@ -457,6 +486,7 @@ class PdfPipeline(Pipeline):
         partial_reasons: list[str],
         ocr_pages: list[str] | None = None,
         ocr_document_type: str | None = None,
+        revision_coverage: dict[str, Any] | None = None,
     ) -> PipelineResult:
         client = get_chat_client("ingest")
         all_sections: list[dict[str, Any]] = []
@@ -482,6 +512,7 @@ class PdfPipeline(Pipeline):
                     "sibling_names": ctx.sibling_names,
                     "catalog_sketch": ctx.catalog_sketch,
                     "tag_vocabulary": ctx.tag_vocabulary,
+                    **({"revision_coverage": revision_coverage} if revision_coverage else {}),
                     "page_count": total_pages,
                     "page_start": start,
                     "page_end": end,
@@ -540,6 +571,8 @@ class PdfPipeline(Pipeline):
             all_sections.extend(result["sections"])
             chunk_summaries.append(result["summary"])
 
+        if revision_coverage:
+            all_sections = self._revision_sections(text_per_page, revision_coverage)
         sections = renumber_sections(all_sections)
         coverage = self._coverage(
             total_pages=total_pages,
@@ -554,6 +587,8 @@ class PdfPipeline(Pipeline):
                 if ocr_used else PDF_TEXT_MAX_INDEX_PAGES
             ),
         )
+        if revision_coverage:
+            self._merge_revision_coverage(coverage, revision_coverage)
         if truncated_chunks:
             coverage["truncated_chunks"] = truncated_chunks
 
